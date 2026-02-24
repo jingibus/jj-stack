@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+#!/bin/sh
+"exec" "/Volumes/source/jj-stack/.venv/bin/python3" "$0" "$@"
 """
 jj-stack: Automate pushing stacks of Jujutsu changes to GitHub as pull requests.
 
@@ -17,12 +18,23 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+try:
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.spinner import Spinner
+    from rich.table import Table
+    from rich.text import Text
+except ImportError:
+    print("Error: 'rich' package is required. Install it with: pip install rich", file=sys.stderr)
+    sys.exit(1)
+
 
 # ============================================================================
 # Global Configuration
 # ============================================================================
 
 VERBOSE = False
+GITHUB_OPERATION_COUNTS = defaultdict(int)
 
 
 # ============================================================================
@@ -43,12 +55,95 @@ class Change:
 
 
 # ============================================================================
+# Progress Display
+# ============================================================================
+
+class PushProgress:
+    """Multi-line status board for push operations, rendered to stderr."""
+
+    WAITING = "waiting"
+    IN_PROGRESS = "in_progress"
+    SUCCESS = "success"
+    FAILED = "failed"
+
+    def __init__(self, changes: List[Change]):
+        self.changes = changes
+        self.console = Console(file=sys.stderr)
+        self.statuses: Dict[str, Tuple[str, str]] = {}
+        for c in changes:
+            self.statuses[c.change_id] = (self.WAITING, "Waiting")
+        self._live: Optional[Live] = None
+
+    def _build_display(self):
+        """Build the Rich renderable for the current state."""
+        table = Table(
+            show_header=False,
+            box=None,
+            padding=(0, 1),
+            pad_edge=False,
+        )
+        table.add_column("icon", width=2, no_wrap=True)
+        table.add_column("change", style="dim", no_wrap=True)
+        table.add_column("title", max_width=40, no_wrap=True, overflow="ellipsis")
+        table.add_column("status")
+
+        for change in self.changes:
+            state, message = self.statuses[change.change_id]
+
+            if state == self.WAITING:
+                icon = Text("  ", style="dim")
+                status_text = Text(message, style="dim")
+            elif state == self.IN_PROGRESS:
+                icon = Spinner("dots")
+                status_text = Text(message, style="yellow")
+            elif state == self.SUCCESS:
+                icon = Text("✓", style="green")
+                status_text = Text(message)
+            else:
+                icon = Text("✗", style="red")
+                status_text = Text(message, style="red")
+
+            table.add_row(
+                icon,
+                Text(change.change_id),
+                Text(change.title),
+                status_text,
+            )
+
+        header = Text(f"Pushing {len(self.changes)} changes\n", style="bold")
+        return Group(header, table)
+
+    def update(self, change_id: str, state: str, message: str):
+        """Update a change's status and refresh the display."""
+        self.statuses[change_id] = (state, message)
+        if self._live:
+            self._live.update(self._build_display())
+
+    def __enter__(self):
+        self._live = Live(
+            self._build_display(),
+            console=self.console,
+            refresh_per_second=10,
+        )
+        self._live.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        if self._live:
+            return self._live.__exit__(*args)
+
+
+# ============================================================================
 # Command Execution Utilities
 # ============================================================================
 
 def run(cmd: List[str], check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
     """Execute a command and return the result."""
     if VERBOSE:
+        if cmd[0] == 'gh':
+            operation_key = ' '.join(cmd[:3]) if len(cmd) >= 3 else ' '.join(cmd)
+            GITHUB_OPERATION_COUNTS[operation_key] += 1
+            print(f"[GitHub API] {operation_key}", file=sys.stderr)
         print(f"[VERBOSE] Running: {' '.join(cmd)}", file=sys.stderr)
 
     try:
@@ -524,6 +619,168 @@ def update_pr(
 # Commands
 # ============================================================================
 
+def _cmd_push_verbose(changes, username, date, change_to_bookmark):
+    """Push with scrolling text output (verbose mode)."""
+    print(f"Found {len(changes)} change(s) in stack")
+
+    # First pass: create bookmarks and push them
+    print("\nCreating bookmarks and pushing to GitHub...")
+    for change in changes:
+        bookmark = ensure_bookmark(change, username, date)
+        change_to_bookmark[change.change_id] = bookmark
+        print(f"  {change.change_id}: {bookmark}")
+
+        if VERBOSE:
+            print(f"[VERBOSE] Pushing bookmark: {bookmark}", file=sys.stderr)
+        result = run(['jj', 'git', 'push', '--bookmark', bookmark], check=False)
+        if result.returncode != 0:
+            print(f"Warning: Failed to push bookmark {bookmark}", file=sys.stderr)
+
+    # Second pass: create or update PRs
+    print("\nCreating/updating PRs...")
+
+    if VERBOSE:
+        print(f"[VERBOSE] Fetching existing PRs for user: {username}", file=sys.stderr)
+    change_to_pr = fetch_prs_batch(username, state='open')
+
+    newly_created = []
+    for change in changes:
+        bookmark = change_to_bookmark[change.change_id]
+
+        if VERBOSE:
+            print(f"[VERBOSE] Determining base branch for {change.change_id}", file=sys.stderr)
+        parent_id = get_parent_change_id(change.change_id)
+        if parent_id and parent_id in change_to_bookmark:
+            base_branch = change_to_bookmark[parent_id]
+        else:
+            base_branch = "master"
+
+        if VERBOSE:
+            print(f"[VERBOSE] Base branch for {change.change_id}: {base_branch}", file=sys.stderr)
+
+        pr_number = change_to_pr.get(change.change_id)
+
+        if not pr_number:
+            try:
+                pr_number = create_pr(bookmark, change, base_branch, changes, username, change_to_pr)
+                if pr_number:
+                    change_to_pr[change.change_id] = pr_number
+                    newly_created.append(change.change_id)
+                    print(f"  ✓ Created PR #{pr_number}: {change.title}")
+            except Exception as e:
+                print(f"  ✗ Failed to create PR for {change.change_id}: {e}", file=sys.stderr)
+        else:
+            try:
+                update_pr(pr_number, change, base_branch, changes, username, change_to_pr)
+                print(f"  ✓ Updated PR #{pr_number}: {change.title}")
+            except Exception as e:
+                print(f"  ✗ Failed to update PR #{pr_number}: {e}", file=sys.stderr)
+
+    # Third pass: update cross-references for newly created PRs
+    if newly_created:
+        print("\nUpdating PR cross-references...")
+        for change in changes:
+            if change.change_id in newly_created:
+                pr_number = change_to_pr.get(change.change_id)
+                if pr_number:
+                    parent_id = get_parent_change_id(change.change_id)
+                    if parent_id and parent_id in change_to_bookmark:
+                        base_branch = change_to_bookmark[parent_id]
+                    else:
+                        base_branch = "master"
+
+                    try:
+                        update_pr(pr_number, change, base_branch, changes, username, change_to_pr)
+                        print(f"  ✓ Updated PR #{pr_number} with full cross-references")
+                    except Exception as e:
+                        print(f"  ✗ Failed to update PR #{pr_number}: {e}", file=sys.stderr)
+
+    print(f"\nStack pushed successfully! ({len(changes)} changes)")
+
+    if VERBOSE:
+        print("\n" + "=" * 60, file=sys.stderr)
+        print("GitHub API Operation Statistics:", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        total_operations = 0
+        for operation, count in sorted(GITHUB_OPERATION_COUNTS.items()):
+            print(f"  {operation}: {count}", file=sys.stderr)
+            total_operations += count
+        print("-" * 60, file=sys.stderr)
+        print(f"  Total GitHub API operations: {total_operations}", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+
+
+def _cmd_push_progress(changes, username, date, change_to_bookmark):
+    """Push with Rich progress board on stderr."""
+    with PushProgress(changes) as progress:
+        # Pass 1: create bookmarks and push them
+        for change in changes:
+            progress.update(change.change_id, PushProgress.IN_PROGRESS, "Creating bookmark...")
+            bookmark = ensure_bookmark(change, username, date)
+            change_to_bookmark[change.change_id] = bookmark
+
+            progress.update(change.change_id, PushProgress.IN_PROGRESS, "Pushing bookmark...")
+            result = run(['jj', 'git', 'push', '--bookmark', bookmark], check=False)
+            if result.returncode != 0:
+                progress.update(change.change_id, PushProgress.FAILED, "Push failed")
+            else:
+                progress.update(change.change_id, PushProgress.SUCCESS, "Pushed")
+
+        # Pass 2: create or update PRs
+        progress.update(changes[0].change_id, PushProgress.IN_PROGRESS, "Fetching existing PRs...")
+        change_to_pr = fetch_prs_batch(username, state='open')
+
+        newly_created = []
+        for change in changes:
+            bookmark = change_to_bookmark[change.change_id]
+            parent_id = get_parent_change_id(change.change_id)
+            if parent_id and parent_id in change_to_bookmark:
+                base_branch = change_to_bookmark[parent_id]
+            else:
+                base_branch = "master"
+
+            pr_number = change_to_pr.get(change.change_id)
+
+            if not pr_number:
+                progress.update(change.change_id, PushProgress.IN_PROGRESS, "Creating PR...")
+                try:
+                    pr_number = create_pr(bookmark, change, base_branch, changes, username, change_to_pr)
+                    if pr_number:
+                        change_to_pr[change.change_id] = pr_number
+                        newly_created.append(change.change_id)
+                        progress.update(change.change_id, PushProgress.SUCCESS, f"Created PR #{pr_number}")
+                except Exception:
+                    progress.update(change.change_id, PushProgress.FAILED, "PR creation failed")
+            else:
+                progress.update(change.change_id, PushProgress.IN_PROGRESS, f"Updating PR #{pr_number}...")
+                try:
+                    update_pr(pr_number, change, base_branch, changes, username, change_to_pr)
+                    progress.update(change.change_id, PushProgress.SUCCESS, f"Updated PR #{pr_number}")
+                except Exception:
+                    progress.update(change.change_id, PushProgress.FAILED, "PR update failed")
+
+        # Pass 3: update cross-references for newly created PRs
+        if newly_created:
+            for change in changes:
+                if change.change_id in newly_created:
+                    pr_number = change_to_pr.get(change.change_id)
+                    if pr_number:
+                        parent_id = get_parent_change_id(change.change_id)
+                        if parent_id and parent_id in change_to_bookmark:
+                            base_branch = change_to_bookmark[parent_id]
+                        else:
+                            base_branch = "master"
+
+                        progress.update(change.change_id, PushProgress.IN_PROGRESS, "Updating cross-refs...")
+                        try:
+                            update_pr(pr_number, change, base_branch, changes, username, change_to_pr)
+                            progress.update(change.change_id, PushProgress.SUCCESS, f"PR #{pr_number} ready")
+                        except Exception:
+                            progress.update(change.change_id, PushProgress.FAILED, "Cross-ref update failed")
+
+    print(f"\nStack pushed successfully! ({len(changes)} changes)")
+
+
 def cmd_push(args):
     """Push entire stack to GitHub, creating/updating PRs."""
     if VERBOSE:
@@ -538,92 +795,13 @@ def cmd_push(args):
         print("No changes in stack.")
         return
 
-    print(f"Found {len(changes)} change(s) in stack")
-
     date = datetime.now().strftime('%Y-%m-%d')
     change_to_bookmark = {}
 
-    # First pass: create bookmarks and push them
-    print("\nCreating bookmarks and pushing to GitHub...")
-    for change in changes:
-        bookmark = ensure_bookmark(change, username, date)
-        change_to_bookmark[change.change_id] = bookmark
-        print(f"  {change.change_id}: {bookmark}")
-
-        # Push bookmark
-        if VERBOSE:
-            print(f"[VERBOSE] Pushing bookmark: {bookmark}", file=sys.stderr)
-        result = run(['jj', 'git', 'push', '--bookmark', bookmark], check=False)
-        if result.returncode != 0:
-            print(f"Warning: Failed to push bookmark {bookmark}", file=sys.stderr)
-
-    # Second pass: create or update PRs
-    print("\nCreating/updating PRs...")
-
-    # First, find all existing PRs (single batch call)
     if VERBOSE:
-        print(f"[VERBOSE] Fetching existing PRs for user: {username}", file=sys.stderr)
-    change_to_pr = fetch_prs_batch(username, state='open')
-
-    # Now create/update PRs in order
-    newly_created = []
-    for change in changes:
-        bookmark = change_to_bookmark[change.change_id]
-
-        # Determine base branch
-        if VERBOSE:
-            print(f"[VERBOSE] Determining base branch for {change.change_id}", file=sys.stderr)
-        parent_id = get_parent_change_id(change.change_id)
-        if parent_id and parent_id in change_to_bookmark:
-            base_branch = change_to_bookmark[parent_id]
-        else:
-            base_branch = "master"
-
-        if VERBOSE:
-            print(f"[VERBOSE] Base branch for {change.change_id}: {base_branch}", file=sys.stderr)
-
-        # Check if PR already exists
-        pr_number = change_to_pr.get(change.change_id)
-
-        if not pr_number:
-            # Create new PR
-            try:
-                pr_number = create_pr(bookmark, change, base_branch, changes, username, change_to_pr)
-                if pr_number:
-                    change_to_pr[change.change_id] = pr_number
-                    newly_created.append(change.change_id)
-                    print(f"  ✓ Created PR #{pr_number}: {change.title}")
-            except Exception as e:
-                print(f"  ✗ Failed to create PR for {change.change_id}: {e}", file=sys.stderr)
-        else:
-            # Update existing PR
-            try:
-                update_pr(pr_number, change, base_branch, changes, username, change_to_pr)
-                print(f"  ✓ Updated PR #{pr_number}: {change.title}")
-            except Exception as e:
-                print(f"  ✗ Failed to update PR #{pr_number}: {e}", file=sys.stderr)
-
-    # Third pass: Update descriptions for newly created PRs to include links to each other
-    if newly_created:
-        print("\nUpdating PR cross-references...")
-        for change in changes:
-            if change.change_id in newly_created:
-                pr_number = change_to_pr.get(change.change_id)
-                if pr_number:
-                    # Determine base branch
-                    parent_id = get_parent_change_id(change.change_id)
-                    if parent_id and parent_id in change_to_bookmark:
-                        base_branch = change_to_bookmark[parent_id]
-                    else:
-                        base_branch = "master"
-
-                    try:
-                        update_pr(pr_number, change, base_branch, changes, username, change_to_pr)
-                        print(f"  ✓ Updated PR #{pr_number} with full cross-references")
-                    except Exception as e:
-                        print(f"  ✗ Failed to update PR #{pr_number}: {e}", file=sys.stderr)
-
-    print(f"\nStack pushed successfully! ({len(changes)} changes)")
+        _cmd_push_verbose(changes, username, date, change_to_bookmark)
+    else:
+        _cmd_push_progress(changes, username, date, change_to_bookmark)
 
 
 def cmd_status(args):

@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mv:*)",
+      "WebSearch",
+      "WebFetch(domain:rich.readthedocs.io)",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:sqlpey.com)",
+      "WebFetch(domain:itnext.io)",
+      "WebFetch(domain:www.lihaoyi.com)",
+      "WebFetch(domain:brianlinkletter.com)",
+      "WebFetch(domain:realpython.com)",
+      "Bash(python3:*)",
+      "Bash(tail:*)",
+      "Bash(head:*)",
+      "Bash(/Volumes/source/jj-stack/.venv/bin/python3:*)",
+      "Bash(ls:*)",
+      "Bash(chmod +x:*)",
+      "Bash(ln:*)"
+    ]
+  }
+}
